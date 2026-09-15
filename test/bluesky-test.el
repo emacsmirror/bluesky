@@ -840,6 +840,103 @@
                    '("at://did/root/post"
                      "at://did/reply/post")))))
 
+(ert-deftest bluesky-notifications-hydrate-subject-posts-in-batches ()
+  (let* ((uris (mapcar
+                (lambda (number)
+                  (format "at://did:plc:me/app.bsky.feed.post/%d" number))
+                (number-sequence 1 26)))
+         (notifications
+          (vconcat
+           (mapcar (lambda (uri)
+                     (list :uri (concat uri "-like")
+                           :reason "like"
+                           :reasonSubject uri))
+                   uris)))
+         batches)
+    (cl-letf (((symbol-function 'bluesky-conn-get-posts)
+               (lambda (_host _handle batch)
+                 (push batch batches)
+                 (futur-done
+                  (list :posts
+                        (vconcat
+                         (mapcar
+                          (lambda (uri)
+                            (list :uri uri :record (list :text uri)))
+                          batch)))))))
+      (let* ((response
+              (futur-blocking-wait-to-get-result
+               (bluesky--notifications-response-resolve-subject-posts
+                "host" "handle" (list :notifications notifications))))
+             (resolved (append (plist-get response :notifications) nil)))
+        (should (equal (sort (mapcar #'length batches) #'<) '(1 25)))
+        (should (equal
+                 (plist-get (plist-get (car resolved) :bluesky-subject-post)
+                            :uri)
+                 (car uris)))
+        (should (equal (plist-get (bluesky--notification-post (car resolved))
+                                  :uri)
+                       (car uris)))))))
+
+(ert-deftest bluesky-notifications-survive-subject-hydration-failure ()
+  (let* ((notification
+          (list :uri "at://did:plc:liker/app.bsky.feed.like/one"
+                :reason "like"
+                :reasonSubject "at://did:plc:me/app.bsky.feed.post/one"))
+         (response (list :notifications (vector notification))))
+    (cl-letf (((symbol-function 'bluesky-conn-get-posts)
+               (lambda (&rest _args)
+                 (futur-failed '(error "post unavailable")))))
+      (should
+       (equal
+        (futur-blocking-wait-to-get-result
+         (bluesky--notifications-response-resolve-subject-posts
+          "host" "handle" response))
+        response)))))
+
+(ert-deftest bluesky-notification-post-prefers-new-reply-over-subject ()
+  (let* ((reply-uri "at://did:plc:replier/app.bsky.feed.post/reply")
+         (subject-uri "at://did:plc:me/app.bsky.feed.post/original")
+         (notification
+          (list :uri reply-uri
+                :cid "reply-cid"
+                :author (list :did "did:plc:replier")
+                :reason "reply"
+                :reasonSubject subject-uri
+                :record (list :$type "app.bsky.feed.post"
+                              :text "the new reply")
+                :bluesky-subject-post
+                (list :uri subject-uri :record (list :text "original")))))
+    (should (equal (plist-get (bluesky--notification-post notification) :uri)
+                   reply-uri))
+    (should-not (bluesky--notification-subject-post-uri notification))))
+
+(ert-deftest bluesky-notification-via-repost-hydrates-record-subject ()
+  (let* ((post-uri "at://did:plc:me/app.bsky.feed.post/original")
+         (repost-uri "at://did:plc:other/app.bsky.feed.repost/via")
+         (notification
+          (list :reason "like-via-repost"
+                :reasonSubject repost-uri
+                :record (list :$type "app.bsky.feed.like"
+                              :subject (list :uri post-uri :cid "post-cid")))))
+    (should (equal (bluesky--notification-subject-post-uri notification)
+                   post-uri))))
+
+(ert-deftest bluesky-update-notification-updates-hydrated-subject-post ()
+  (let* ((post-uri "at://did:plc:me/app.bsky.feed.post/original")
+         (notification
+          (list :uri "at://did:plc:other/app.bsky.feed.like/like"
+                :record (list :$type "app.bsky.feed.like")
+                :bluesky-subject-post
+                (list :uri post-uri :likeCount 1 :record (list :text "post"))))
+         (updated
+          (bluesky--update-notification-post
+           notification post-uri
+           (lambda (post)
+             (plist-put (copy-sequence post) :likeCount 2)))))
+    (should (= (plist-get (plist-get updated :bluesky-subject-post)
+                          :likeCount)
+               2))))
+
 (provide 'bluesky-test)
 
 ;;; bluesky-test.el ends here
